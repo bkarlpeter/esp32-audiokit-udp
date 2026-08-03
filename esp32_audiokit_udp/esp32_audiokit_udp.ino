@@ -307,8 +307,12 @@ static void loopSlave() {
         if (hdr.len == 0 || hdr.len > CHUNK_BYTES) continue;
 
         // ── Sequence resync – handles master reboot or large wrap-around ──
+        // diff < -(JITTER_SLOTS): very old packet or master reboot → resync.
+        // Slightly late packets (diff in [-JITTER_SLOTS, 0)) are silently
+        // discarded; they are already past the playback head and useless.
+        // diff >= JITTER_SLOTS*4: implausibly large forward jump → resync.
         int32_t diff = (int32_t)(hdr.seq - g_rxExpected);
-        if (diff < 0 || diff >= (int32_t)(JITTER_SLOTS * 4)) {
+        if (diff < -(int32_t)JITTER_SLOTS || diff >= (int32_t)(JITTER_SLOTS * 4)) {
             Serial.printf("[SLAVE] Seq resync (got %u, expected %u)\n",
                           hdr.seq, g_rxExpected);
             g_rxExpected   = hdr.seq;
