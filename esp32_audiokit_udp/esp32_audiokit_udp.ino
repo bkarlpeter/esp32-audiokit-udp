@@ -5,11 +5,11 @@
  * Flash the same binary to both boards; the role is set via Serial and
  * persisted in EEPROM (see "Role" section below).
  *
- * ── Audio flow ────────────────────────────────────────────────────────────
+ * ── Audio flow ───────────────────────────────────────────────────────────
  *   Master  Line-In ──[I2S]──► RMS check ──► smooth gain ──► 4 KB PCM chunk ──► UDP ──►┐
  *   Slave   ◄── UDP ◄── jitter buffer ◄── smooth gain ◄──[I2S]◄── Line-Out           ◄─┘
  *
- * ── Role ───────────────────────────────────────────────────────────────
+ * ── Role ──────────────────────────────────────────────────────────────────
  *   Role (MASTER/SLAVE) is persisted in EEPROM. Fresh boards default to
  *   MASTER. Set the role once per board via Serial: "mode master" or
  *   "mode slave" (takes effect after the next reboot).
@@ -24,7 +24,7 @@
  *   • Unicast delivery  – slave announces its IP via periodic "hello"
  *                         packets; master sends audio point-to-point
  *                         instead of broadcast (unreliable on ESP32 softAP)
- *   • Small chunks       – kept below the WiFi MTU to avoid IP fragmentation
+ *   • Small chunks      – kept below the WiFi MTU to avoid IP fragmentation
  *   • Smooth gain ramp  – gradual per-chunk ramp avoids hiss, pops, pumping
  *   • Jitter buffer     – ring buffer absorbs packet-timing variation and
  *                         prevents underruns; silence substituted on dropout
@@ -39,6 +39,8 @@
 #include <WiFi.h>
 #include <WiFiUDP.h>
 #include <EEPROM.h>
+#include <cmath>    // sqrt, fminf, fmaxf
+#include <cstring>  // memcpy, memset
 #include "AudioTools.h"
 #include "AudioTools/AudioLibs/AudioBoardStream.h"  // AudioBoardStream (Phil Schatzmann)
 
@@ -93,21 +95,22 @@ static AudioBoardStream g_kit(AudioKitEs8388V2);
 #else
 #error "Unsupported AUDIOKIT_ES8388_VARIANT"
 #endif
-static WiFiUDP        g_audioUdp;   // Audio stream socket
-static WiFiUDP        g_statusUdp;  // Out-of-band status socket
+
+static WiFiUDP g_audioUdp;   // Audio stream socket
+static WiFiUDP g_statusUdp;  // Out-of-band status socket
 
 // Master-side state
 static uint32_t g_txSeq       = 0;
-static float    g_masterGain  = GAIN_DEFAULT;   // Current (ramped) send gain
-static int      g_quietCount  = 0;              // Consecutive quiet-chunk counter
+static float    g_masterGain  = GAIN_DEFAULT;    // Current (ramped) send gain
+static int      g_quietCount  = 0;               // Consecutive quiet-chunk counter
 static bool     g_quietWarned = false;
 
 // Unicast target learned from the slave's periodic "hello" packets.
 // Broadcast delivery on the ESP32 softAP is unreliable (DTIM-buffered,
 // frequently dropped), so audio/status are always sent point-to-point.
 static IPAddress g_slaveIp;
-static bool      g_slaveKnown     = false;
-static uint32_t  g_lastHelloRxMs  = 0;
+static bool      g_slaveKnown    = false;
+static uint32_t  g_lastHelloRxMs = 0;
 static constexpr uint32_t SLAVE_TIMEOUT_MS = 5000;
 
 // Slave-side state – jitter buffer
@@ -117,11 +120,11 @@ struct JitterSlot {
     uint8_t  data[CHUNK_BYTES];
 };
 static JitterSlot g_jitter[JITTER_SLOTS];
-static uint32_t   g_rxExpected   = 0;           // Next sequence the player expects
-static float      g_slaveGain    = GAIN_DEFAULT; // Current (ramped) playback gain
-static bool       g_slaveStarted = false;        // True once pre-buffer is primed
-static uint32_t   g_lastPlayMs   = 0;
-static uint32_t   g_lastHelloTxMs = 0;           // Last time we announced ourselves to master
+static uint32_t   g_rxExpected    = 0;            // Next sequence the player expects
+static float      g_slaveGain     = GAIN_DEFAULT; // Current (ramped) playback gain
+static bool       g_slaveStarted  = false;        // True once pre-buffer is primed
+static uint32_t   g_lastPlayMs    = 0;
+static uint32_t   g_lastHelloTxMs = 0;            // Last time we announced ourselves to master
 static constexpr uint32_t HELLO_INTERVAL_MS = 1000;
 
 // ─── Audio helpers ────────────────────────────────────────────────────────
@@ -147,15 +150,20 @@ static float computeRMS(const int16_t *samples, size_t nSamples) {
  */
 static void applyGain(int16_t *samples, size_t nSamples,
                       float &currentGain, float targetGain) {
+    if (samples == nullptr || nSamples == 0) return;
+
     float stepPerSample = GAIN_STEP_PER_CHUNK / (float)nSamples;
     for (size_t i = 0; i < nSamples; ++i) {
-        if      (currentGain < targetGain)
+        if (currentGain < targetGain) {
             currentGain = fminf(currentGain + stepPerSample, targetGain);
-        else if (currentGain > targetGain)
+        } else if (currentGain > targetGain) {
             currentGain = fmaxf(currentGain - stepPerSample, targetGain);
+        }
 
         float v = samples[i] * currentGain;
-        samples[i] = (int16_t)fmaxf(-32768.0f, fminf(32767.0f, v));
+        if (v > 32767.0f) v = 32767.0f;
+        if (v < -32768.0f) v = -32768.0f;
+        samples[i] = (int16_t)v;
     }
 }
 
@@ -240,7 +248,9 @@ static void handleSerialCommands() {
             }
             input = "";
         } else {
-            input += c;
+            if (input.length() < 120) {   // prevent unbounded growth on malformed input
+                input += c;
+            }
         }
     }
 }
@@ -252,8 +262,7 @@ static void setupMaster() {
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASS);
     WiFi.setSleep(false);  // keep radio awake so broadcast frames aren't delayed/dropped
-    Serial.printf("[MASTER] AP ready.  IP: %s\n",
-                  WiFi.softAPIP().toString().c_str());
+    Serial.printf("[MASTER] AP ready.  IP: %s\n", WiFi.softAPIP().toString().c_str());
 
     // Configure AudioKit for line-in capture (ADC path)
     auto cfg = g_kit.defaultConfig(RX_MODE);
@@ -286,8 +295,7 @@ static void loopMaster() {
             if (sp.type == STATUS_HELLO) {
                 IPAddress from = g_statusUdp.remoteIP();
                 if (!g_slaveKnown || from != g_slaveIp) {
-                    Serial.printf("[MASTER] Slave registered: %s\n",
-                                  from.toString().c_str());
+                    Serial.printf("[MASTER] Slave registered: %s\n", from.toString().c_str());
                 }
                 g_slaveIp       = from;
                 g_slaveKnown    = true;
@@ -297,13 +305,14 @@ static void loopMaster() {
             g_statusUdp.flush();
         }
     }
+
     if (g_slaveKnown && millis() - g_lastHelloRxMs > SLAVE_TIMEOUT_MS) {
         Serial.println("[MASTER] Slave timed out - pausing audio send");
         g_slaveKnown = false;
     }
 
     // ── Read exactly one 4 KB chunk from line-in (blocks until complete) ──
-    for (size_t filled = 0; filled < CHUNK_BYTES; ) {
+    for (size_t filled = 0; filled < CHUNK_BYTES;) {
         int n = g_kit.readBytes(s_txBuf + filled, CHUNK_BYTES - filled);
         if (n > 0) filled += (size_t)n;
         else delay(1);  // yield briefly if nothing ready yet
@@ -313,13 +322,12 @@ static void loopMaster() {
     size_t   nSamples = CHUNK_BYTES / BYTES_PER_SAMPLE;
 
     // ── Quiet-input detection ─────────────────────────────────────────────
-    // Compute RMS every chunk; if consistently below threshold, warn once.
     float rms = computeRMS(samples, nSamples);
     if (rms < QUIET_THRESHOLD) {
         ++g_quietCount;
         if (g_quietCount >= QUIET_WARN_CHUNKS && !g_quietWarned) {
-            Serial.printf("[WARN] Line-in too quiet (RMS=%.5f, threshold=%.5f)."
-                          "  Check source level.\n", rms, QUIET_THRESHOLD);
+            Serial.printf("[WARN] Line-in too quiet (RMS=%.5f, threshold=%.5f).  Check source level.\n",
+                          rms, QUIET_THRESHOLD);
             g_quietWarned = true;
 
             // Also send a UDP status packet so the slave can display it
@@ -331,14 +339,11 @@ static void loopMaster() {
             }
         }
     } else {
-        // Level recovered – reset counters so the warning fires again later
         g_quietCount  = 0;
         g_quietWarned = false;
     }
 
     // ── Smooth gain ───────────────────────────────────────────────────────
-    // g_masterGain ramps toward GAIN_DEFAULT each chunk.
-    // Adjust g_masterGain externally (e.g. via Serial) to shift send level.
     applyGain(samples, nSamples, g_masterGain, GAIN_DEFAULT);
 
     // ── Artificial send delay (manually tunable via 'latency' command) ────
@@ -365,7 +370,7 @@ static void loopMaster() {
 static void setupSlave() {
     Serial.println("[SLAVE] Connecting to master AP...");
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);  // disable modem-sleep – power save causes missed broadcast frames
+    WiFi.setSleep(false);  // disable modem-sleep – power save causes missed frames
     WiFi.begin(AP_SSID, AP_PASS);
 
     unsigned long t0 = millis();
@@ -377,6 +382,7 @@ static void setupSlave() {
             ESP.restart();
         }
     }
+
     Serial.printf("\n[SLAVE] Connected.  IP=%s  GW=%s\n",
                   WiFi.localIP().toString().c_str(),
                   WiFi.gatewayIP().toString().c_str());
@@ -396,7 +402,6 @@ static void setupSlave() {
     g_audioUdp.begin(AUDIO_UDP_PORT);
     g_statusUdp.begin(STATUS_UDP_PORT);
 
-    // Initialise all jitter-buffer slots as empty
     for (int i = 0; i < JITTER_SLOTS; ++i) {
         g_jitter[i].valid = false;
         g_jitter[i].seq   = 0;
@@ -423,7 +428,10 @@ static void loopSlave() {
     // ── Receive incoming audio packets into the jitter buffer ─────────────
     int pktLen;
     while ((pktLen = g_audioUdp.parsePacket()) > 0) {
-        if ((size_t)pktLen < HEADER_SIZE + 1) { g_audioUdp.flush(); continue; }
+        if ((size_t)pktLen < HEADER_SIZE + 1) {
+            g_audioUdp.flush();
+            continue;
+        }
 
         size_t toRead = (pktLen < (int)PACKET_SIZE) ? (size_t)pktLen : PACKET_SIZE;
         g_audioUdp.read(s_rxBuf, toRead);
@@ -432,15 +440,9 @@ static void loopSlave() {
         memcpy(&hdr, s_rxBuf, HEADER_SIZE);
         if (hdr.len == 0 || hdr.len > CHUNK_BYTES) continue;
 
-        // ── Sequence resync – handles master reboot or large wrap-around ──
-        // diff < -(JITTER_SLOTS): very old packet or master reboot → resync.
-        // Slightly late packets (diff in [-JITTER_SLOTS, 0)) are silently
-        // discarded; they are already past the playback head and useless.
-        // diff >= JITTER_SLOTS*4: implausibly large forward jump → resync.
         int32_t diff = (int32_t)(hdr.seq - g_rxExpected);
         if (diff < -(int32_t)JITTER_SLOTS || diff >= (int32_t)(JITTER_SLOTS * 4)) {
-            Serial.printf("[SLAVE] Seq resync (got %u, expected %u)\n",
-                          hdr.seq, g_rxExpected);
+            Serial.printf("[SLAVE] Seq resync (got %u, expected %u)\n", hdr.seq, g_rxExpected);
             g_rxExpected   = hdr.seq;
             g_slaveStarted = false;
             for (int i = 0; i < JITTER_SLOTS; ++i) g_jitter[i].valid = false;
@@ -452,7 +454,14 @@ static void loopSlave() {
             uint32_t slot = hdr.seq % JITTER_SLOTS;
             g_jitter[slot].valid = true;
             g_jitter[slot].seq   = hdr.seq;
+
+            // copy only actual payload
             memcpy(g_jitter[slot].data, s_rxBuf + HEADER_SIZE, hdr.len);
+
+            // zero-fill tail if packet shorter than CHUNK_BYTES
+            if (hdr.len < CHUNK_BYTES) {
+                memset(g_jitter[slot].data + hdr.len, 0, CHUNK_BYTES - hdr.len);
+            }
         }
     }
 
@@ -463,8 +472,7 @@ static void loopSlave() {
             StatusPacket sp;
             g_statusUdp.read(reinterpret_cast<uint8_t *>(&sp), sizeof(sp));
             if (sp.type == STATUS_QUIET_INPUT) {
-                Serial.printf("[STATUS] Master: line-in too quiet "
-                              "(RMS=%.5f, threshold=%.5f)\n",
+                Serial.printf("[STATUS] Master: line-in too quiet (RMS=%.5f, threshold=%.5f)\n",
                               sp.rms, sp.threshold);
             }
         } else {
@@ -473,15 +481,14 @@ static void loopSlave() {
     }
 
     // ── Pre-buffer: hold playback until minimum slots are filled ──────────
-    // This prevents an underrun right at startup before packets have arrived.
     if (!g_slaveStarted) {
         int count = 0;
         for (int i = 0; i < JITTER_SLOTS; ++i)
             if (g_jitter[i].valid) ++count;
         if (count < JITTER_PRE_BUFFER) return;
         g_slaveStarted = true;
-        Serial.printf("[SLAVE] Jitter buffer primed (%d/%d slots), "
-                      "starting playback\n", count, JITTER_SLOTS);
+        Serial.printf("[SLAVE] Jitter buffer primed (%d/%d slots), starting playback\n",
+                      count, JITTER_SLOTS);
     }
 
     // ── Periodic buffer-depth report (approximate playback latency) ───────
@@ -496,22 +503,19 @@ static void loopSlave() {
 
     // ── Consume the next expected slot ────────────────────────────────────
     uint32_t slot = g_rxExpected % JITTER_SLOTS;
-    bool      got  = g_jitter[slot].valid && (g_jitter[slot].seq == g_rxExpected);
+    bool got = g_jitter[slot].valid && (g_jitter[slot].seq == g_rxExpected);
 
     if (got) {
-        // Happy path: packet is ready
         memcpy(s_playBuf, g_jitter[slot].data, CHUNK_BYTES);
         g_jitter[slot].valid = false;
         ++g_rxExpected;
         g_lastPlayMs = millis();
     } else if (millis() - g_lastPlayMs > (uint32_t)JITTER_SKIP_MS) {
-        // Packet has been missing too long – advance and substitute silence
         memset(s_playBuf, 0, CHUNK_BYTES);
         ++g_rxExpected;
         g_lastPlayMs = millis();
         Serial.println("[SLAVE] Dropped packet – substituting silence");
     } else {
-        // Still within the skip window – output silence, hold position
         memset(s_playBuf, 0, CHUNK_BYTES);
     }
 
@@ -520,9 +524,8 @@ static void loopSlave() {
     size_t   nSamples = CHUNK_BYTES / BYTES_PER_SAMPLE;
     applyGain(samples, nSamples, g_slaveGain, GAIN_DEFAULT);
 
-    // write() on AudioBoardStream blocks until I2S accepts the data, which
-    // naturally paces playback to the correct sample rate.
-    for (size_t written = 0; written < CHUNK_BYTES; ) {
+    // write() on AudioBoardStream blocks until I2S accepts the data.
+    for (size_t written = 0; written < CHUNK_BYTES;) {
         int n = g_kit.write(s_playBuf + written, CHUNK_BYTES - written);
         if (n > 0) written += (size_t)n;
         else delay(1);
