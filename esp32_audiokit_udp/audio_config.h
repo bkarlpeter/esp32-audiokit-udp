@@ -12,9 +12,11 @@
 #define BITS                16      // Bits per sample
 #define BYTES_PER_SAMPLE    (BITS / 8)
 
-// 4 KB per UDP datagram ≈ 23 ms of stereo 44.1 kHz 16-bit PCM.
-// Larger chunks → fewer packets, less overhead, smoother flow.
-#define CHUNK_BYTES         4096
+// 1 KB per UDP datagram ≈ 5.8 ms of stereo 44.1 kHz 16-bit PCM.
+// Kept below the ~1472-byte WiFi MTU so the datagram is never IP-fragmented –
+// broadcast frames have no MAC-layer ACK/retry, so losing one fragment of a
+// larger datagram would drop the whole chunk.
+#define CHUNK_BYTES         1024
 
 // ─── Network ──────────────────────────────────────────────────────────────
 // Both boards use these same credentials; the master creates the AP,
@@ -44,11 +46,11 @@
 #define GAIN_STEP_PER_CHUNK 0.02f
 
 // ─── Jitter buffer (Slave only) ───────────────────────────────────────────
-// Ring buffer depth – 8 slots × 23 ms ≈ 185 ms of headroom to absorb
+// Ring buffer depth – 32 slots × ~5.8 ms ≈ 185 ms of headroom to absorb
 // packet-timing variation without causing audible glitches.
-#define JITTER_SLOTS        8
+#define JITTER_SLOTS        32
 // Minimum filled slots before the slave starts playback (pre-buffer prevents
 // an underrun right at startup)
-#define JITTER_PRE_BUFFER   3
+#define JITTER_PRE_BUFFER   8
 // How long (ms) to wait for a missing packet before skipping it with silence
 #define JITTER_SKIP_MS      60

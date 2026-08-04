@@ -2,19 +2,17 @@
  * esp32_audiokit_udp.ino
  *
  * Single-firmware sketch for two ESP32 Audiokit boards.
- * Flash the same binary to both boards; they negotiate roles automatically.
+ * Flash the same binary to both boards; the role is set via Serial and
+ * persisted in EEPROM (see "Role" section below).
  *
  * ── Audio flow ────────────────────────────────────────────────────────────
  *   Master  Line-In ──[I2S]──► RMS check ──► smooth gain ──► 4 KB PCM chunk ──► UDP ──►┐
  *   Slave   ◄── UDP ◄── jitter buffer ◄── smooth gain ◄──[I2S]◄── Line-Out           ◄─┘
  *
- * ── Role negotiation ──────────────────────────────────────────────────────
- *   On boot both boards scan for the "AudioKit-Master" Wi-Fi AP.
- *   • AP found   → become Slave, connect and start receiving audio.
- *   • AP missing → add a short MAC-derived stagger delay, scan once more.
- *     Still missing → become Master, create the AP and start streaming.
- *   The stagger prevents both boards electing themselves master when powered
- *   simultaneously (the one with the longer delay will find the AP).
+ * ── Role ───────────────────────────────────────────────────────────────
+ *   Role (MASTER/SLAVE) is persisted in EEPROM. Fresh boards default to
+ *   MASTER. Set the role once per board via Serial: "mode master" or
+ *   "mode slave" (takes effect after the next reboot).
  *
  * ── Quiet-input detection (Master only) ──────────────────────────────────
  *   Every 4 KB chunk the master computes a normalised RMS value.
@@ -23,22 +21,33 @@
  *   packet so the slave can echo it too.
  *
  * ── Quality features ──────────────────────────────────────────────────────
- *   • 4 KB chunks       – fewer packets, lower overhead, smoother flow
+ *   • Unicast delivery  – slave announces its IP via periodic "hello"
+ *                         packets; master sends audio point-to-point
+ *                         instead of broadcast (unreliable on ESP32 softAP)
+ *   • Small chunks       – kept below the WiFi MTU to avoid IP fragmentation
  *   • Smooth gain ramp  – gradual per-chunk ramp avoids hiss, pops, pumping
- *   • Jitter buffer     – 8-slot ring absorbs packet-timing variation and
+ *   • Jitter buffer     – ring buffer absorbs packet-timing variation and
  *                         prevents underruns; silence substituted on dropout
  *
  * Dependencies (install via Arduino Library Manager or platformio.ini):
- *   - pschatzmann/arduino-audio-tools  (AudioTools)
- *   - pschatzmann/arduino-audiokit     (AudioKit stream + HAL)
+ *   - pschatzmann/arduino-audio-tools   (AudioTools)
+ *   - pschatzmann/arduino-audio-driver  (AudioBoardStream + codec HAL)
  */
 
 #include "audio_config.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUDP.h>
-#include <esp_wifi.h>               // esp_read_mac
-#include "AudioLibs/AudioKit.h"     // AudioKitStream (Phil Schatzmann)
+#include <EEPROM.h>
+#include "AudioTools.h"
+#include "AudioTools/AudioLibs/AudioBoardStream.h"  // AudioBoardStream (Phil Schatzmann)
+
+// ES8388-Codec-Board-Variante; bei Bedarf auf AudioKitEs8388V2 umstellen.
+#define AUDIOKIT_ES8388_VARIANT 1
+
+#define BOARD_ROLE_MASTER 1
+#define BOARD_ROLE_SLAVE  2
+#define EEPROM_MAGIC 0xA55A2033
 
 // ─── Packet structures ────────────────────────────────────────────────────
 
@@ -48,13 +57,15 @@ struct __attribute__((packed)) AudioHeader {
     uint32_t len;   // Payload bytes in this datagram (always CHUNK_BYTES)
 };
 
-// Broadcast by master when line-in level is below threshold
+// Sent by master when line-in level is below threshold, or by slave as a
+// registration "hello" so the master learns its unicast IP address.
 struct __attribute__((packed)) StatusPacket {
-    uint8_t type;        // STATUS_QUIET_INPUT
+    uint8_t type;        // STATUS_QUIET_INPUT or STATUS_HELLO
     float   rms;
     float   threshold;
 };
 static constexpr uint8_t STATUS_QUIET_INPUT = 0x01;
+static constexpr uint8_t STATUS_HELLO       = 0x02;
 
 static constexpr size_t HEADER_SIZE = sizeof(AudioHeader);
 static constexpr size_t PACKET_SIZE = HEADER_SIZE + CHUNK_BYTES;
@@ -64,7 +75,24 @@ static constexpr size_t PACKET_SIZE = HEADER_SIZE + CHUNK_BYTES;
 enum class Role { UNDECIDED, MASTER, SLAVE };
 static Role g_role = Role::UNDECIDED;
 
-static AudioKitStream g_kit;        // Hardware I2S ↔ codec interface
+struct RoleConfig {
+    uint32_t magic;
+    uint8_t  role;       // BOARD_ROLE_MASTER or BOARD_ROLE_SLAVE
+    uint8_t  latencyMs;  // Master: artificial per-chunk send delay (0-200 ms)
+};
+static RoleConfig g_roleConfig;
+static constexpr uint32_t LATENCY_REPORT_INTERVAL_MS = 5000;
+static constexpr uint32_t CHUNK_DURATION_MS =
+    (CHUNK_BYTES / BYTES_PER_SAMPLE / NUM_CHANNELS) * 1000UL / SAMPLE_RATE;
+static uint32_t g_lastLatencyReportMs = 0;
+
+#if AUDIOKIT_ES8388_VARIANT == 1
+static AudioBoardStream g_kit(AudioKitEs8388V1);  // Hardware I2S <-> codec interface
+#elif AUDIOKIT_ES8388_VARIANT == 2
+static AudioBoardStream g_kit(AudioKitEs8388V2);
+#else
+#error "Unsupported AUDIOKIT_ES8388_VARIANT"
+#endif
 static WiFiUDP        g_audioUdp;   // Audio stream socket
 static WiFiUDP        g_statusUdp;  // Out-of-band status socket
 
@@ -73,6 +101,14 @@ static uint32_t g_txSeq       = 0;
 static float    g_masterGain  = GAIN_DEFAULT;   // Current (ramped) send gain
 static int      g_quietCount  = 0;              // Consecutive quiet-chunk counter
 static bool     g_quietWarned = false;
+
+// Unicast target learned from the slave's periodic "hello" packets.
+// Broadcast delivery on the ESP32 softAP is unreliable (DTIM-buffered,
+// frequently dropped), so audio/status are always sent point-to-point.
+static IPAddress g_slaveIp;
+static bool      g_slaveKnown     = false;
+static uint32_t  g_lastHelloRxMs  = 0;
+static constexpr uint32_t SLAVE_TIMEOUT_MS = 5000;
 
 // Slave-side state – jitter buffer
 struct JitterSlot {
@@ -85,6 +121,8 @@ static uint32_t   g_rxExpected   = 0;           // Next sequence the player expe
 static float      g_slaveGain    = GAIN_DEFAULT; // Current (ramped) playback gain
 static bool       g_slaveStarted = false;        // True once pre-buffer is primed
 static uint32_t   g_lastPlayMs   = 0;
+static uint32_t   g_lastHelloTxMs = 0;           // Last time we announced ourselves to master
+static constexpr uint32_t HELLO_INTERVAL_MS = 1000;
 
 // ─── Audio helpers ────────────────────────────────────────────────────────
 
@@ -121,56 +159,90 @@ static void applyGain(int16_t *samples, size_t nSamples,
     }
 }
 
-// ─── Role negotiation ─────────────────────────────────────────────────────
+// ─── Role persistence ─────────────────────────────────────────────────────
 
-/** Returns true if AP_SSID is visible in the current Wi-Fi scan results. */
-static bool scanForMasterAP() {
-    int n = WiFi.scanNetworks(/*async*/false, /*hidden*/false,
-                              /*passive*/false, /*max_ms_per_chan*/DISCOVERY_SCAN_MS);
-    for (int i = 0; i < n; ++i) {
-        if (WiFi.SSID(i) == AP_SSID) return true;
+/** Loads the persisted role from EEPROM; fresh boards default to MASTER. */
+static void loadRoleConfig() {
+    EEPROM.begin(sizeof(RoleConfig));
+    EEPROM.get(0, g_roleConfig);
+    if (g_roleConfig.magic != EEPROM_MAGIC) {
+        g_roleConfig.magic     = EEPROM_MAGIC;
+        g_roleConfig.role      = BOARD_ROLE_MASTER;
+        g_roleConfig.latencyMs = 0;
+        EEPROM.put(0, g_roleConfig);
+        EEPROM.commit();
     }
-    return false;
 }
 
-/**
- * negotiateRole – decide at boot whether this board is Master or Slave.
- *
- * Algorithm:
- *   1. Scan for AP_SSID.  If found → Slave.
- *   2. Wait a short delay proportional to the MAC LSB (0…MAC_STAGGER_MS).
- *      This staggers simultaneous boots so one board creates the AP first.
- *   3. Scan again.  If found → Slave.
- *   4. Otherwise → Master.
- */
-static void negotiateRole() {
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect(true);
+static void saveRoleConfig() {
+    g_roleConfig.magic = EEPROM_MAGIC;
+    EEPROM.put(0, g_roleConfig);
+    EEPROM.commit();
+}
 
-    Serial.println("[ROLE] Scanning for existing master AP...");
-    if (scanForMasterAP()) {
-        Serial.println("[ROLE] Master AP found → SLAVE");
-        g_role = Role::SLAVE;
-        return;
+/** Handles "mode master" / "mode slave" / "info" / "help" Serial commands. */
+static void handleSerialCommands() {
+    static String input;
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (input.length() > 0) {
+                input.trim();
+                int spaceIdx = input.indexOf(' ');
+                String cmd = (spaceIdx >= 0) ? input.substring(0, spaceIdx) : input;
+                String arg = (spaceIdx >= 0) ? input.substring(spaceIdx + 1) : "";
+
+                if (cmd == "mode") {
+                    if (arg == "master") {
+                        g_roleConfig.role = BOARD_ROLE_MASTER;
+                        saveRoleConfig();
+                        Serial.println("Role set to MASTER - rebooting...");
+                        delay(200);
+                        ESP.restart();
+                    } else if (arg == "slave") {
+                        g_roleConfig.role = BOARD_ROLE_SLAVE;
+                        saveRoleConfig();
+                        Serial.println("Role set to SLAVE - rebooting...");
+                        delay(200);
+                        ESP.restart();
+                    } else {
+                        Serial.println("Use: mode master|slave");
+                    }
+                } else if (cmd == "info") {
+                    Serial.print("Persisted role: ");
+                    Serial.println(g_roleConfig.role == BOARD_ROLE_MASTER ? "MASTER" : "SLAVE");
+                    Serial.print("Active role: ");
+                    Serial.println(g_role == Role::MASTER ? "MASTER" : "SLAVE");
+                    Serial.print("Latency delay: ");
+                    Serial.print(g_roleConfig.latencyMs);
+                    Serial.println(" ms");
+                } else if (cmd == "latency") {
+                    if (arg == "+") {
+                        g_roleConfig.latencyMs = (uint8_t)constrain(g_roleConfig.latencyMs + 5, 0, 200);
+                    } else if (arg == "-") {
+                        g_roleConfig.latencyMs = (uint8_t)constrain((int)g_roleConfig.latencyMs - 5, 0, 200);
+                    } else if (arg.length() > 0) {
+                        g_roleConfig.latencyMs = (uint8_t)constrain(arg.toInt(), 0, 200);
+                    } else {
+                        Serial.println("Use: latency +|-|<0-200>");
+                        input = "";
+                        continue;
+                    }
+                    saveRoleConfig();
+                    Serial.print("Latency delay set to ");
+                    Serial.print(g_roleConfig.latencyMs);
+                    Serial.println(" ms");
+                } else if (cmd == "help") {
+                    Serial.println("Commands: mode master|slave, latency +|-|<0-200>, info, help");
+                } else {
+                    Serial.println("Unknown command (try 'help')");
+                }
+            }
+            input = "";
+        } else {
+            input += c;
+        }
     }
-
-    // Derive a stagger delay from the last byte of the station MAC address
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    uint32_t staggerMs = (uint32_t)((uint64_t)mac[5] * MAC_STAGGER_MS / 255UL);
-    Serial.printf("[ROLE] No master found.  Stagger %u ms (MAC LSB=0x%02X)...\n",
-                  staggerMs, mac[5]);
-    delay(staggerMs);
-
-    Serial.println("[ROLE] Re-scanning after stagger...");
-    if (scanForMasterAP()) {
-        Serial.println("[ROLE] Master AP found after stagger → SLAVE");
-        g_role = Role::SLAVE;
-        return;
-    }
-
-    Serial.println("[ROLE] No master detected → MASTER");
-    g_role = Role::MASTER;
 }
 
 // ─── Master ───────────────────────────────────────────────────────────────
@@ -179,16 +251,21 @@ static void setupMaster() {
     Serial.println("[MASTER] Creating Wi-Fi AP...");
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASS);
+    WiFi.setSleep(false);  // keep radio awake so broadcast frames aren't delayed/dropped
     Serial.printf("[MASTER] AP ready.  IP: %s\n",
                   WiFi.softAPIP().toString().c_str());
 
     // Configure AudioKit for line-in capture (ADC path)
     auto cfg = g_kit.defaultConfig(RX_MODE);
-    cfg.input_device    = AUDIO_HAL_ADC_INPUT_LINE1;
+    cfg.input_device    = ADC_INPUT_LINE2;
     cfg.sample_rate     = SAMPLE_RATE;
     cfg.channels        = NUM_CHANNELS;
     cfg.bits_per_sample = BITS;
-    g_kit.begin(cfg);
+    cfg.sd_active       = false;
+    if (!g_kit.begin(cfg)) {
+        Serial.println("[MASTER] Audio init failed");
+        while (true) delay(1000);
+    }
 
     g_audioUdp.begin(AUDIO_UDP_PORT);
     g_statusUdp.begin(STATUS_UDP_PORT);
@@ -200,6 +277,31 @@ static void setupMaster() {
 static uint8_t s_txBuf[CHUNK_BYTES];
 
 static void loopMaster() {
+    // ── Learn/refresh the slave's unicast IP from its "hello" packets ──────
+    int sPktLen;
+    while ((sPktLen = g_statusUdp.parsePacket()) > 0) {
+        if ((size_t)sPktLen >= sizeof(StatusPacket)) {
+            StatusPacket sp;
+            g_statusUdp.read(reinterpret_cast<uint8_t *>(&sp), sizeof(sp));
+            if (sp.type == STATUS_HELLO) {
+                IPAddress from = g_statusUdp.remoteIP();
+                if (!g_slaveKnown || from != g_slaveIp) {
+                    Serial.printf("[MASTER] Slave registered: %s\n",
+                                  from.toString().c_str());
+                }
+                g_slaveIp       = from;
+                g_slaveKnown    = true;
+                g_lastHelloRxMs = millis();
+            }
+        } else {
+            g_statusUdp.flush();
+        }
+    }
+    if (g_slaveKnown && millis() - g_lastHelloRxMs > SLAVE_TIMEOUT_MS) {
+        Serial.println("[MASTER] Slave timed out - pausing audio send");
+        g_slaveKnown = false;
+    }
+
     // ── Read exactly one 4 KB chunk from line-in (blocks until complete) ──
     for (size_t filled = 0; filled < CHUNK_BYTES; ) {
         int n = g_kit.readBytes(s_txBuf + filled, CHUNK_BYTES - filled);
@@ -221,11 +323,12 @@ static void loopMaster() {
             g_quietWarned = true;
 
             // Also send a UDP status packet so the slave can display it
-            IPAddress broadcast(192, 168, 4, 255);
-            StatusPacket sp{ STATUS_QUIET_INPUT, rms, QUIET_THRESHOLD };
-            g_statusUdp.beginPacket(broadcast, STATUS_UDP_PORT);
-            g_statusUdp.write(reinterpret_cast<uint8_t *>(&sp), sizeof(sp));
-            g_statusUdp.endPacket();
+            if (g_slaveKnown) {
+                StatusPacket sp{ STATUS_QUIET_INPUT, rms, QUIET_THRESHOLD };
+                g_statusUdp.beginPacket(g_slaveIp, STATUS_UDP_PORT);
+                g_statusUdp.write(reinterpret_cast<uint8_t *>(&sp), sizeof(sp));
+                g_statusUdp.endPacket();
+            }
         }
     } else {
         // Level recovered – reset counters so the warning fires again later
@@ -238,11 +341,20 @@ static void loopMaster() {
     // Adjust g_masterGain externally (e.g. via Serial) to shift send level.
     applyGain(samples, nSamples, g_masterGain, GAIN_DEFAULT);
 
-    // ── Transmit ──────────────────────────────────────────────────────────
-    AudioHeader hdr{ g_txSeq++, (uint32_t)CHUNK_BYTES };
-    IPAddress   dest(192, 168, 4, 255);  // AP-subnet broadcast
+    // ── Artificial send delay (manually tunable via 'latency' command) ────
+    if (g_roleConfig.latencyMs > 0) delay(g_roleConfig.latencyMs);
 
-    g_audioUdp.beginPacket(dest, AUDIO_UDP_PORT);
+    if (millis() - g_lastLatencyReportMs >= LATENCY_REPORT_INTERVAL_MS) {
+        g_lastLatencyReportMs = millis();
+        Serial.printf("[MASTER] Latency delay: %u ms\n", g_roleConfig.latencyMs);
+    }
+
+    // ── Transmit (unicast – no slave registered yet means nothing to send) ─
+    if (!g_slaveKnown) return;
+
+    AudioHeader hdr{ g_txSeq++, (uint32_t)CHUNK_BYTES };
+
+    g_audioUdp.beginPacket(g_slaveIp, AUDIO_UDP_PORT);
     g_audioUdp.write(reinterpret_cast<uint8_t *>(&hdr), HEADER_SIZE);
     g_audioUdp.write(s_txBuf, CHUNK_BYTES);
     g_audioUdp.endPacket();
@@ -253,6 +365,7 @@ static void loopMaster() {
 static void setupSlave() {
     Serial.println("[SLAVE] Connecting to master AP...");
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);  // disable modem-sleep – power save causes missed broadcast frames
     WiFi.begin(AP_SSID, AP_PASS);
 
     unsigned long t0 = millis();
@@ -270,11 +383,15 @@ static void setupSlave() {
 
     // Configure AudioKit for line-out playback (DAC path)
     auto cfg = g_kit.defaultConfig(TX_MODE);
-    cfg.output_device   = AUDIO_HAL_DAC_OUTPUT_LINE1;
+    cfg.output_device   = DAC_OUTPUT_ALL;
     cfg.sample_rate     = SAMPLE_RATE;
     cfg.channels        = NUM_CHANNELS;
     cfg.bits_per_sample = BITS;
-    g_kit.begin(cfg);
+    cfg.sd_active       = false;
+    if (!g_kit.begin(cfg)) {
+        Serial.println("[SLAVE] Audio init failed");
+        while (true) delay(1000);
+    }
 
     g_audioUdp.begin(AUDIO_UDP_PORT);
     g_statusUdp.begin(STATUS_UDP_PORT);
@@ -294,6 +411,15 @@ static uint8_t s_rxBuf[PACKET_SIZE];
 static uint8_t s_playBuf[CHUNK_BYTES];
 
 static void loopSlave() {
+    // ── Announce ourselves to the master so it knows our unicast IP ───────
+    if (millis() - g_lastHelloTxMs >= HELLO_INTERVAL_MS) {
+        g_lastHelloTxMs = millis();
+        StatusPacket sp{ STATUS_HELLO, 0.0f, 0.0f };
+        g_statusUdp.beginPacket(WiFi.gatewayIP(), STATUS_UDP_PORT);
+        g_statusUdp.write(reinterpret_cast<uint8_t *>(&sp), sizeof(sp));
+        g_statusUdp.endPacket();
+    }
+
     // ── Receive incoming audio packets into the jitter buffer ─────────────
     int pktLen;
     while ((pktLen = g_audioUdp.parsePacket()) > 0) {
@@ -358,6 +484,16 @@ static void loopSlave() {
                       "starting playback\n", count, JITTER_SLOTS);
     }
 
+    // ── Periodic buffer-depth report (approximate playback latency) ───────
+    if (millis() - g_lastLatencyReportMs >= LATENCY_REPORT_INTERVAL_MS) {
+        g_lastLatencyReportMs = millis();
+        int count = 0;
+        for (int i = 0; i < JITTER_SLOTS; ++i)
+            if (g_jitter[i].valid) ++count;
+        Serial.printf("[SLAVE] Buffer depth: %d/%d slots (~%u ms)\n",
+                      count, JITTER_SLOTS, count * CHUNK_DURATION_MS);
+    }
+
     // ── Consume the next expected slot ────────────────────────────────────
     uint32_t slot = g_rxExpected % JITTER_SLOTS;
     bool      got  = g_jitter[slot].valid && (g_jitter[slot].seq == g_rxExpected);
@@ -384,7 +520,7 @@ static void loopSlave() {
     size_t   nSamples = CHUNK_BYTES / BYTES_PER_SAMPLE;
     applyGain(samples, nSamples, g_slaveGain, GAIN_DEFAULT);
 
-    // write() on AudioKitStream blocks until I2S accepts the data, which
+    // write() on AudioBoardStream blocks until I2S accepts the data, which
     // naturally paces playback to the correct sample rate.
     for (size_t written = 0; written < CHUNK_BYTES; ) {
         int n = g_kit.write(s_playBuf + written, CHUNK_BYTES - written);
@@ -399,17 +535,22 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("\n=== ESP32 Audiokit UDP Streaming ===");
-    Serial.println("    AudioTools / AudioKit by Phil Schatzmann");
-    Serial.println("    Automatic master/slave role negotiation");
+    Serial.println("    AudioTools / AudioBoardStream by Phil Schatzmann");
     Serial.println();
 
-    negotiateRole();
+    loadRoleConfig();
+    Serial.print("[ROLE] Persisted role: ");
+    Serial.println(g_roleConfig.role == BOARD_ROLE_MASTER ? "MASTER" : "SLAVE");
+    Serial.println("[ROLE] Change with 'mode master' / 'mode slave' via Serial (takes effect after reboot)");
+
+    g_role = (g_roleConfig.role == BOARD_ROLE_SLAVE) ? Role::SLAVE : Role::MASTER;
 
     if (g_role == Role::MASTER) setupMaster();
     else                        setupSlave();
 }
 
 void loop() {
+    handleSerialCommands();
     if (g_role == Role::MASTER) loopMaster();
     else                        loopSlave();
 }
