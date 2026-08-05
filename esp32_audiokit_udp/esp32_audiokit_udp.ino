@@ -41,6 +41,7 @@
 #include <EEPROM.h>
 #include <cmath>    // sqrt, fminf, fmaxf
 #include <cstring>  // memcpy, memset
+
 #include "AudioTools.h"
 #include "AudioTools/AudioLibs/AudioBoardStream.h"  // AudioBoardStream (Phil Schatzmann)
 
@@ -59,15 +60,20 @@ struct __attribute__((packed)) AudioHeader {
     uint32_t len;   // Payload bytes in this datagram (always CHUNK_BYTES)
 };
 
-// Sent by master when line-in level is below threshold, or by slave as a
-// registration "hello" so the master learns its unicast IP address.
+// Sent by master when line-in level is below threshold, by slave as a
+// registration "hello" so the master learns its unicast IP address, or by
+// either side during a latency measurement (PING from master, PONG echo
+// from slave, matched by seq).
 struct __attribute__((packed)) StatusPacket {
-    uint8_t type;        // STATUS_QUIET_INPUT or STATUS_HELLO
-    float   rms;
-    float   threshold;
+    uint8_t  type;        // STATUS_QUIET_INPUT / STATUS_HELLO / STATUS_PING / STATUS_PONG
+    float    rms;
+    float    threshold;
+    uint32_t seq;         // Probe sequence number, used only by PING/PONG
 };
 static constexpr uint8_t STATUS_QUIET_INPUT = 0x01;
 static constexpr uint8_t STATUS_HELLO       = 0x02;
+static constexpr uint8_t STATUS_PING        = 0x03;
+static constexpr uint8_t STATUS_PONG        = 0x04;
 
 static constexpr size_t HEADER_SIZE = sizeof(AudioHeader);
 static constexpr size_t PACKET_SIZE = HEADER_SIZE + CHUNK_BYTES;
@@ -84,6 +90,13 @@ struct RoleConfig {
 };
 static RoleConfig g_roleConfig;
 static constexpr uint32_t LATENCY_REPORT_INTERVAL_MS = 5000;
+
+// Latency measurement (Master only, triggered via 'latency measure'):
+// averages the round-trip time of several UDP probes to the slave and
+// stores half of it (one-way estimate) as the new g_roleConfig.latencyMs.
+static constexpr uint32_t LATENCY_PROBE_COUNT        = 20;
+static constexpr uint32_t LATENCY_PROBE_INTERVAL_MS  = 30;
+static constexpr uint32_t LATENCY_PROBE_TIMEOUT_MS   = 300;
 static constexpr uint32_t CHUNK_DURATION_MS =
     (CHUNK_BYTES / BYTES_PER_SAMPLE / NUM_CHANNELS) * 1000UL / SAMPLE_RATE;
 static uint32_t g_lastLatencyReportMs = 0;
@@ -104,6 +117,8 @@ static uint32_t g_txSeq       = 0;
 static float    g_masterGain  = GAIN_DEFAULT;    // Current (ramped) send gain
 static int      g_quietCount  = 0;               // Consecutive quiet-chunk counter
 static bool     g_quietWarned = false;
+static bool     g_rawDbgEnabled  = false;        // Print raw ADC peak/RMS (diagnostic)
+static uint32_t g_rawDbgLastMs   = 0;
 
 // Unicast target learned from the slave's periodic "hello" packets.
 // Broadcast delivery on the ESP32 softAP is unreliable (DTIM-buffered,
@@ -123,9 +138,28 @@ static JitterSlot g_jitter[JITTER_SLOTS];
 static uint32_t   g_rxExpected    = 0;            // Next sequence the player expects
 static float      g_slaveGain     = GAIN_DEFAULT; // Current (ramped) playback gain
 static bool       g_slaveStarted  = false;        // True once pre-buffer is primed
+static uint32_t   g_pktRxCount    = 0;             // UDP packets actually received
+static uint32_t   g_pktDropCount = 0;             // Slots substituted with silence
+static uint32_t   g_pktOverflowCount = 0;          // Packets discarded: buffer backlog full
+static uint32_t   g_driftSkipCount   = 0;          // Extra slots skipped to drain clock-drift backlog
+static uint32_t   g_lastStatsMs  = 0;
+static constexpr int JITTER_HIGH_WATER = JITTER_SLOTS - 6;  // start draining backlog before it overflows
 static uint32_t   g_lastPlayMs    = 0;
 static uint32_t   g_lastHelloTxMs = 0;            // Last time we announced ourselves to master
 static constexpr uint32_t HELLO_INTERVAL_MS = 1000;
+
+// Master-side test tone (Serial: "testtone on|off") – generates a sine wave
+// in place of Line-In, to test the pipeline without a physical audio source.
+static bool          g_testToneEnabled = false;
+static float         g_toneAngle       = 0.0f;
+static uint32_t      g_toneNextUs      = 0;  // absolute micros() deadline for next chunk
+static constexpr float TEST_TONE_FREQ_HZ   = 440.0f;
+static constexpr float TEST_TONE_AMPLITUDE = 0.3f;
+static constexpr float TEST_TONE_AMPLITUDE_LOW = 0.03f;  // ~ same peak as the quiet real Line-In signal
+static float         g_testToneAmplitude = TEST_TONE_AMPLITUDE;
+static constexpr float TEST_TONE_TWO_PI    = 6.28318530718f;
+static constexpr uint32_t CHUNK_DURATION_US =
+    (uint32_t)((uint64_t)(CHUNK_BYTES / BYTES_PER_SAMPLE / NUM_CHANNELS) * 1000000ULL / SAMPLE_RATE);
 
 // ─── Audio helpers ────────────────────────────────────────────────────────
 
@@ -141,6 +175,19 @@ static float computeRMS(const int16_t *samples, size_t nSamples) {
         sum += s * s;
     }
     return (float)sqrt(sum / (double)nSamples);
+}
+
+/** generateTestTone – fills an interleaved PCM buffer with a sine wave. */
+static void generateTestTone(int16_t *samples, size_t nSamples) {
+    size_t nFrames = nSamples / NUM_CHANNELS;
+    for (size_t i = 0; i < nFrames; ++i) {
+        int16_t v = (int16_t)(sinf(g_toneAngle) * g_testToneAmplitude * 32767.0f);
+        for (size_t ch = 0; ch < NUM_CHANNELS; ++ch) {
+            samples[i * NUM_CHANNELS + ch] = v;
+        }
+        g_toneAngle += TEST_TONE_TWO_PI * TEST_TONE_FREQ_HZ / SAMPLE_RATE;
+        if (g_toneAngle > TEST_TONE_TWO_PI) g_toneAngle -= TEST_TONE_TWO_PI;
+    }
 }
 
 /**
@@ -188,6 +235,68 @@ static void saveRoleConfig() {
     EEPROM.commit();
 }
 
+/**
+ * measureLatency – blocking round-trip measurement to the registered slave.
+ * Sends LATENCY_PROBE_COUNT pings, waits for each pong, averages the
+ * round-trip time, halves it for a one-way estimate, clamps to [0,200] ms,
+ * and persists it as the new artificial send delay (g_roleConfig.latencyMs).
+ * Pauses audio streaming for its short duration (a few hundred ms).
+ */
+static void measureLatency() {
+    if (!g_slaveKnown) {
+        Serial.println("[LATENCY] No slave registered - aborting measurement");
+        return;
+    }
+
+    Serial.println("[LATENCY] Measuring round-trip latency to slave...");
+    uint64_t sumUs = 0;
+    uint32_t got    = 0;
+
+    for (uint32_t seq = 0; seq < LATENCY_PROBE_COUNT; ++seq) {
+        StatusPacket ping{ STATUS_PING, 0.0f, 0.0f, seq };
+        uint32_t sentUs = micros();
+        g_statusUdp.beginPacket(g_slaveIp, STATUS_UDP_PORT);
+        g_statusUdp.write(reinterpret_cast<uint8_t *>(&ping), sizeof(ping));
+        g_statusUdp.endPacket();
+
+        uint32_t deadline = millis() + LATENCY_PROBE_TIMEOUT_MS;
+        bool matched = false;
+        while (millis() < deadline) {
+            int pktLen = g_statusUdp.parsePacket();
+            if (pktLen >= (int)sizeof(StatusPacket)) {
+                StatusPacket resp;
+                g_statusUdp.read(reinterpret_cast<uint8_t *>(&resp), sizeof(resp));
+                if (resp.type == STATUS_PONG && resp.seq == seq) {
+                    sumUs += (uint32_t)(micros() - sentUs);
+                    ++got;
+                    matched = true;
+                    break;
+                }
+                // Ignore unrelated status packets (e.g. a hello) during the probe window
+            }
+        }
+        if (!matched) {
+            Serial.printf("[LATENCY] Probe %u/%u timed out\n", seq + 1, LATENCY_PROBE_COUNT);
+        }
+        delay(LATENCY_PROBE_INTERVAL_MS);
+    }
+
+    if (got == 0) {
+        Serial.println("[LATENCY] Measurement failed - no responses received");
+        return;
+    }
+
+    uint32_t avgRttUs   = (uint32_t)(sumUs / got);
+    uint32_t oneWayMs   = (avgRttUs / 2) / 1000;
+    uint8_t  newLatency = (uint8_t)constrain(oneWayMs, 0, 200);
+
+    g_roleConfig.latencyMs = newLatency;
+    saveRoleConfig();
+
+    Serial.printf("[LATENCY] %u/%u probes answered, avg RTT=%.1f ms, stored latency=%u ms\n",
+                  got, LATENCY_PROBE_COUNT, avgRttUs / 1000.0f, newLatency);
+}
+
 /** Handles "mode master" / "mode slave" / "info" / "help" Serial commands. */
 static void handleSerialCommands() {
     static String input;
@@ -224,15 +333,37 @@ static void handleSerialCommands() {
                     Serial.print("Latency delay: ");
                     Serial.print(g_roleConfig.latencyMs);
                     Serial.println(" ms");
+                } else if (cmd == "gain") {
+                    if (arg.length() > 0) {
+                        int pct = constrain(arg.toInt(), 0, 100);
+                        g_kit.setInputVolume(pct);
+                        Serial.printf("Input PGA gain set to %d%%\n", pct);
+                    } else {
+                        Serial.println("Use: gain <0-100>");
+                    }
+                } else if (cmd == "rawdbg") {
+                    if (arg == "on") {
+                        g_rawDbgEnabled = true;
+                        Serial.println("Raw ADC peak/RMS debug ON");
+                    } else if (arg == "off") {
+                        g_rawDbgEnabled = false;
+                        Serial.println("Raw ADC peak/RMS debug OFF");
+                    } else {
+                        Serial.println("Use: rawdbg on|off");
+                    }
                 } else if (cmd == "latency") {
-                    if (arg == "+") {
+                    if (arg == "measure") {
+                        measureLatency();
+                        input = "";
+                        continue;
+                    } else if (arg == "+") {
                         g_roleConfig.latencyMs = (uint8_t)constrain(g_roleConfig.latencyMs + 5, 0, 200);
                     } else if (arg == "-") {
                         g_roleConfig.latencyMs = (uint8_t)constrain((int)g_roleConfig.latencyMs - 5, 0, 200);
                     } else if (arg.length() > 0) {
                         g_roleConfig.latencyMs = (uint8_t)constrain(arg.toInt(), 0, 200);
                     } else {
-                        Serial.println("Use: latency +|-|<0-200>");
+                        Serial.println("Use: latency +|-|measure|<0-200>");
                         input = "";
                         continue;
                     }
@@ -241,7 +372,22 @@ static void handleSerialCommands() {
                     Serial.print(g_roleConfig.latencyMs);
                     Serial.println(" ms");
                 } else if (cmd == "help") {
-                    Serial.println("Commands: mode master|slave, latency +|-|<0-200>, info, help");
+                    Serial.println("Commands: mode master|slave, latency +|-|measure|<0-200>, testtone on|low|off, gain <0-100>, rawdbg on|off, info, help");
+                } else if (cmd == "testtone") {
+                    if (arg == "on") {
+                        g_testToneEnabled  = true;
+                        g_testToneAmplitude = TEST_TONE_AMPLITUDE;
+                        Serial.println("Test tone ON (440 Hz sine, replaces Line-In)");
+                    } else if (arg == "low") {
+                        g_testToneEnabled  = true;
+                        g_testToneAmplitude = TEST_TONE_AMPLITUDE_LOW;
+                        Serial.println("Test tone ON, low amplitude (simulates quiet Line-In level)");
+                    } else if (arg == "off") {
+                        g_testToneEnabled = false;
+                        Serial.println("Test tone OFF (using Line-In)");
+                    } else {
+                        Serial.println("Use: testtone on|low|off");
+                    }
                 } else {
                     Serial.println("Unknown command (try 'help')");
                 }
@@ -275,6 +421,7 @@ static void setupMaster() {
         Serial.println("[MASTER] Audio init failed");
         while (true) delay(1000);
     }
+    g_kit.setInputVolume(INPUT_GAIN_PERCENT);  // moderate PGA gain - less self-noise than the 24dB default
 
     g_audioUdp.begin(AUDIO_UDP_PORT);
     g_statusUdp.begin(STATUS_UDP_PORT);
@@ -312,39 +459,67 @@ static void loopMaster() {
     }
 
     // ── Read exactly one 4 KB chunk from line-in (blocks until complete) ──
-    for (size_t filled = 0; filled < CHUNK_BYTES;) {
-        int n = g_kit.readBytes(s_txBuf + filled, CHUNK_BYTES - filled);
-        if (n > 0) filled += (size_t)n;
-        else delay(1);  // yield briefly if nothing ready yet
+    if (g_testToneEnabled) {
+        generateTestTone(reinterpret_cast<int16_t *>(s_txBuf), CHUNK_BYTES / BYTES_PER_SAMPLE);
+        // Pace to real time using an absolute microsecond schedule (avoids
+        // drift from millisecond truncation and from per-chunk overhead).
+        uint32_t now = micros();
+        if (g_toneNextUs == 0) g_toneNextUs = now;
+        int32_t remaining = (int32_t)(g_toneNextUs - now);
+        if (remaining > 0) {
+            delayMicroseconds((uint32_t)remaining);
+        } else if (remaining < -(int32_t)(CHUNK_DURATION_US * 4)) {
+            // Fell far behind (e.g. Serial/network stall) – resync instead of bursting
+            g_toneNextUs = now;
+        }
+        g_toneNextUs += CHUNK_DURATION_US;
+    } else {
+        for (size_t filled = 0; filled < CHUNK_BYTES;) {
+            int n = g_kit.readBytes(s_txBuf + filled, CHUNK_BYTES - filled);
+            if (n > 0) filled += (size_t)n;
+            else delay(1);  // yield briefly if nothing ready yet
+        }
     }
 
     int16_t *samples  = reinterpret_cast<int16_t *>(s_txBuf);
     size_t   nSamples = CHUNK_BYTES / BYTES_PER_SAMPLE;
 
-    // ── Quiet-input detection ─────────────────────────────────────────────
-    float rms = computeRMS(samples, nSamples);
-    if (rms < QUIET_THRESHOLD) {
-        ++g_quietCount;
-        if (g_quietCount >= QUIET_WARN_CHUNKS && !g_quietWarned) {
-            Serial.printf("[WARN] Line-in too quiet (RMS=%.5f, threshold=%.5f).  Check source level.\n",
-                          rms, QUIET_THRESHOLD);
-            g_quietWarned = true;
+    // ── Quiet-input detection (skipped for the synthetic test tone) ───────
+    if (!g_testToneEnabled) {
+        float rms = computeRMS(samples, nSamples);
+        if (rms < QUIET_THRESHOLD) {
+            ++g_quietCount;
+            if (g_quietCount >= QUIET_WARN_CHUNKS && !g_quietWarned) {
+                Serial.printf("[WARN] Line-in too quiet (RMS=%.5f, threshold=%.5f).  Check source level.\n",
+                              rms, QUIET_THRESHOLD);
+                g_quietWarned = true;
 
-            // Also send a UDP status packet so the slave can display it
-            if (g_slaveKnown) {
-                StatusPacket sp{ STATUS_QUIET_INPUT, rms, QUIET_THRESHOLD };
-                g_statusUdp.beginPacket(g_slaveIp, STATUS_UDP_PORT);
-                g_statusUdp.write(reinterpret_cast<uint8_t *>(&sp), sizeof(sp));
-                g_statusUdp.endPacket();
+                // Also send a UDP status packet so the slave can display it
+                if (g_slaveKnown) {
+                    StatusPacket sp{ STATUS_QUIET_INPUT, rms, QUIET_THRESHOLD, 0 };
+                    g_statusUdp.beginPacket(g_slaveIp, STATUS_UDP_PORT);
+                    g_statusUdp.write(reinterpret_cast<uint8_t *>(&sp), sizeof(sp));
+                    g_statusUdp.endPacket();
+                }
             }
+        } else {
+            g_quietCount  = 0;
+            g_quietWarned = false;
         }
-    } else {
-        g_quietCount  = 0;
-        g_quietWarned = false;
-    }
 
-    // ── Smooth gain ───────────────────────────────────────────────────────
-    applyGain(samples, nSamples, g_masterGain, GAIN_DEFAULT);
+        // ── Smooth gain ─────────────────────────────────────────────────
+        applyGain(samples, nSamples, g_masterGain, GAIN_DEFAULT);
+
+        if (g_rawDbgEnabled && millis() - g_rawDbgLastMs >= 500) {
+            g_rawDbgLastMs = millis();
+            int16_t peak = 0;
+            for (size_t i = 0; i < nSamples; ++i) {
+                int16_t a = samples[i] < 0 ? -samples[i] : samples[i];
+                if (a > peak) peak = a;
+            }
+            Serial.printf("[RAWDBG] peak=%d rms=%.5f\n", peak, rms);
+        }
+    }
 
     // ── Artificial send delay (manually tunable via 'latency' command) ────
     if (g_roleConfig.latencyMs > 0) delay(g_roleConfig.latencyMs);
@@ -416,10 +591,22 @@ static uint8_t s_rxBuf[PACKET_SIZE];
 static uint8_t s_playBuf[CHUNK_BYTES];
 
 static void loopSlave() {
+    // ── Reconnect if the AP dropped (e.g. master rebooted) ──────────────
+    static uint32_t s_lastWifiCheckMs = 0;
+    if (millis() - s_lastWifiCheckMs >= 2000) {
+        s_lastWifiCheckMs = millis();
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[SLAVE] WiFi disconnected - reconnecting...");
+            WiFi.disconnect();
+            WiFi.begin(AP_SSID, AP_PASS);
+            g_slaveStarted = false;  // re-prime the jitter buffer once we recover
+        }
+    }
+
     // ── Announce ourselves to the master so it knows our unicast IP ───────
     if (millis() - g_lastHelloTxMs >= HELLO_INTERVAL_MS) {
         g_lastHelloTxMs = millis();
-        StatusPacket sp{ STATUS_HELLO, 0.0f, 0.0f };
+        StatusPacket sp{ STATUS_HELLO, 0.0f, 0.0f, 0 };
         g_statusUdp.beginPacket(WiFi.gatewayIP(), STATUS_UDP_PORT);
         g_statusUdp.write(reinterpret_cast<uint8_t *>(&sp), sizeof(sp));
         g_statusUdp.endPacket();
@@ -435,6 +622,7 @@ static void loopSlave() {
 
         size_t toRead = (pktLen < (int)PACKET_SIZE) ? (size_t)pktLen : PACKET_SIZE;
         g_audioUdp.read(s_rxBuf, toRead);
+        ++g_pktRxCount;
 
         AudioHeader hdr;
         memcpy(&hdr, s_rxBuf, HEADER_SIZE);
@@ -462,6 +650,10 @@ static void loopSlave() {
             if (hdr.len < CHUNK_BYTES) {
                 memset(g_jitter[slot].data + hdr.len, 0, CHUNK_BYTES - hdr.len);
             }
+        } else if (diff >= (int32_t)JITTER_SLOTS) {
+            // Backlog already full (Master clock running slightly faster than Slave
+            // playback) - packet is too far ahead to store, silently lost otherwise.
+            ++g_pktOverflowCount;
         }
     }
 
@@ -469,11 +661,18 @@ static void loopSlave() {
     int sPktLen;
     while ((sPktLen = g_statusUdp.parsePacket()) > 0) {
         if ((size_t)sPktLen >= sizeof(StatusPacket)) {
+            IPAddress pingFrom = g_statusUdp.remoteIP();
             StatusPacket sp;
             g_statusUdp.read(reinterpret_cast<uint8_t *>(&sp), sizeof(sp));
             if (sp.type == STATUS_QUIET_INPUT) {
                 Serial.printf("[STATUS] Master: line-in too quiet (RMS=%.5f, threshold=%.5f)\n",
                               sp.rms, sp.threshold);
+            } else if (sp.type == STATUS_PING) {
+                // Echo back immediately so the master can measure round-trip time
+                StatusPacket pong{ STATUS_PONG, 0.0f, 0.0f, sp.seq };
+                g_statusUdp.beginPacket(pingFrom, STATUS_UDP_PORT);
+                g_statusUdp.write(reinterpret_cast<uint8_t *>(&pong), sizeof(pong));
+                g_statusUdp.endPacket();
             }
         } else {
             g_statusUdp.flush();
@@ -502,6 +701,19 @@ static void loopSlave() {
     }
 
     // ── Consume the next expected slot ────────────────────────────────────
+    // Drift compensation: if the backlog is piling up (Master's ADC clock runs
+    // marginally faster than the Slave's DAC clock), proactively drop one extra
+    // buffered slot so the backlog drains gradually instead of overflowing every
+    // few seconds (which caused periodic multi-packet loss bursts / crackling).
+    int depthNow = 0;
+    for (int i = 0; i < JITTER_SLOTS; ++i)
+        if (g_jitter[i].valid) ++depthNow;
+    if (depthNow > JITTER_HIGH_WATER && g_jitter[g_rxExpected % JITTER_SLOTS].valid) {
+        g_jitter[g_rxExpected % JITTER_SLOTS].valid = false;
+        ++g_rxExpected;
+        ++g_driftSkipCount;
+    }
+
     uint32_t slot = g_rxExpected % JITTER_SLOTS;
     bool got = g_jitter[slot].valid && (g_jitter[slot].seq == g_rxExpected);
 
@@ -514,9 +726,19 @@ static void loopSlave() {
         memset(s_playBuf, 0, CHUNK_BYTES);
         ++g_rxExpected;
         g_lastPlayMs = millis();
-        Serial.println("[SLAVE] Dropped packet – substituting silence");
+        ++g_pktDropCount;
     } else {
         memset(s_playBuf, 0, CHUNK_BYTES);
+    }
+
+    if (millis() - g_lastStatsMs >= 1000) {
+        g_lastStatsMs = millis();
+        Serial.printf("[STATS] rx=%u drops=%u overflow=%u driftSkip=%u rssi=%d dBm\n",
+                      g_pktRxCount, g_pktDropCount, g_pktOverflowCount, g_driftSkipCount, WiFi.RSSI());
+        g_pktRxCount       = 0;
+        g_pktDropCount     = 0;
+        g_pktOverflowCount = 0;
+        g_driftSkipCount   = 0;
     }
 
     // ── Smooth gain and write to line-out ─────────────────────────────────

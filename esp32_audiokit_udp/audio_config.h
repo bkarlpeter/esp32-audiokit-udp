@@ -42,6 +42,11 @@
 
 // ─── Gain / smoothing ─────────────────────────────────────────────────────
 #define GAIN_DEFAULT        1.0f
+// ES8388 Mic-PGA on the Master's Line-In, as a percentage (0-100 -> 0-24dB
+// in 3dB steps). The library default (100 = 24dB) is too hot and pushes the
+// PGA's own noise floor above the real signal - 70 (~18dB) matched with the
+// previously working audio_sync_wlan_v2 setup.
+#define INPUT_GAIN_PERCENT  70
 // Maximum gain change applied per chunk (ramp avoids hiss, pops, pumping)
 #define GAIN_STEP_PER_CHUNK 0.02f
 
